@@ -1,0 +1,341 @@
+---
+title: "snRNA-seq and antibody hashing"
+output: html_notebook
+---
+
+```{r file load and object generation}
+library(Seurat)
+library(dplyr) 
+library(ggplot2)
+library(tidyr)
+# Load the data from the HDF5 file
+mac.data <- Read10X_h5("~sample_filtered_feature_bc_matrix.h5")
+
+# Select cell barcodes detected in both RNA and HTO
+cells.use <- intersect(colnames(mac.data$`Gene Expression`), colnames(mac.data$`Antibody Capture`))
+all.equal(colnames(mac.data$`Gene Expression`), colnames(mac.data$`Antibody Capture`))
+
+# Create the Seurat object with the Gene Expression data
+mac <- CreateSeuratObject(counts = mac.data$`Gene Expression`, min.cells = 3, min.features = 200)
+
+```
+
+```{r HTO addition}
+# create assay object for Ab hashing and find mismatching cell
+#hash_assay <- CreateAssayObject(counts = mac.data$`Antibody Capture`)
+#setdiff(colnames(hash_assay@counts), rownames(mac@meta.data))
+
+# Specify the cell to remove
+cell_to_remove <- "CATCGTCTCGGCTGAC-1"
+
+# Subset the Antibody Capture data to exclude the specified cell and create the assay object
+mac[["HTO"]] <- CreateAssayObject(counts = mac.data$`Antibody Capture`[, !colnames(mac.data$`Antibody Capture`) %in% cell_to_remove])
+
+# Normalize HTO data, use centered log-ratio (CLR) transformation
+mac <- NormalizeData(mac, assay = "HTO", normalization.method = "CLR")
+
+```
+
+```{r Demultiplex cells based on HTO enrichment}
+# documentation for HTODemux()) to adjust the threshold for classification Here we are using
+# the default settings
+mac <- HTODemux(mac, assay = "HTO", positive.quantile = 0.99)
+```
+
+```{r}
+# Global classification results
+table(mac$HTO_classification.global)
+
+# Group cells based on the max HTO signal
+Idents(mac) <- "HTO_maxID"
+
+afternoon_rainbow <- c(
+  "#F4C209",  
+  "#FF8C5A", 
+  "#FF99AD",  
+  "#D9A9E2",  
+  "#8FD8E0", 
+  "#4BAA71"  
+)
+HTO_ridgeplot <- RidgePlot(
+  mac,
+  assay = "HTO",
+  features = rownames(mac[["HTO"]])[1:6],
+  ncol = 2,
+  cols = afternoon_rainbow
+)
+
+print(HTO_ridgeplot)
+```
+
+```{r Compare number of UMIs for singlets, doublets and negative cells}
+Idents(mac) <- "HTO_classification.global"
+#pdf("HTO_vln_plot.pdf", width = 5, height = 4)  # Adjust width and height as needed
+library(wesanderson)
+grandbudapest_colors <- wes_palette("Chevalier1", n = 3, type = "discrete")
+VlnPlot(mac, features = "nCount_RNA", col=grandbudapest_colors, pt.size = 0.1, log = TRUE)
+#dev.off()
+```
+
+```{r}
+# Calculate a tSNE embedding of the HTO data
+DefaultAssay(mac) <- "HTO"
+mac <- ScaleData(mac, features = rownames(mac),
+    verbose = FALSE)
+mac <- RunPCA(mac, features = rownames(mac), approx = FALSE)
+mac <- RunTSNE(mac, dims = 1:8, perplexity = 100)
+DimPlot(mac, cols = grandbudapest_colors)
+
+#Remove negative cells from the object
+mac.subset_neg <- subset(mac, idents = "Negative", invert = TRUE)
+mac.subset_doublet <- subset(mac, idents = "Doublet", invert = FALSE)
+
+# Calculate a tSNE embedding of the HTO data
+DefaultAssay(mac.subset_neg) <- "HTO"
+mac.subset_neg <- ScaleData(mac.subset_neg, features = rownames(mac.subset_neg),
+    verbose = FALSE)
+mac.subset_neg <- RunPCA(mac.subset_neg, features = rownames(mac.subset_neg), approx = FALSE)
+mac.subset_neg <- RunTSNE(mac.subset_neg, dims = 1:8, perplexity = 100)
+DimPlot(mac.subset_neg, cols = afternoon_rainbow)
+```
+
+
+```{r Generate a two dimensional tSNE embedding for HTOs}
+#Remove negative cells from the object
+mac.subset.singlet <- subset(mac, idents = "Singlet", invert = FALSE)
+
+# Calculate a tSNE embedding of the HTO data
+DefaultAssay(mac.subset.singlet) <- "HTO"
+mac.subset.singlet <- ScaleData(mac.subset.singlet, features = rownames(mac.subset.singlet),
+    verbose = FALSE)
+mac.subset.singlet <- RunPCA(mac.subset.singlet, features = rownames(mac.subset.singlet), approx = FALSE)
+mac.subset.singlet <- RunTSNE(mac.subset.singlet, dims = 1:8, perplexity = 100)
+DimPlot(mac.subset.singlet, group.by = "HTO_classification")
+
+# Create a table of the number of cells in each HTO classification
+hto_classification_table <- table(mac.subset_doublet$HTO_classification)
+
+# Print the table
+print(hto_classification_table)
+
+```
+
+```{r QC and selecting cells for further analysis}
+#Set the default assay to RNA
+DefaultAssay(mac.subset.singlet) <- "RNA"
+
+# Set the identity of the Seurat object to HTO barcode classification
+Idents(mac.subset.singlet) <- "HTO_maxID"  # Or use "HTO_classification.global" depending on what you want to group by
+
+```
+
+```{r}
+library(scCustomize)
+mac.subset.singlet <- Add_Cell_QC_Metrics(mac.subset.singlet, species = "human") 
+
+# Plot violin plots for the added metrics
+VlnPlot(
+  object = mac.subset.singlet, 
+  features = c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "log10GenesPerUMI"), 
+  ncol = 3, 
+  group.by = "HTO_maxID",  # Replace with the appropriate grouping column if needed
+  cols = afternoon_rainbow
+)
+
+```
+
+
+```{r Compare QC thresholds}
+# Function to print the number of cells in a Seurat object
+print_cell_count <- function(seurat_obj) {
+  cell_count <- ncol(seurat_obj)
+  cat("Number of cells in the Seurat object:", cell_count, "\n")
+}
+
+# Example usage with your Seurat object
+print_cell_count(mac.subset.singlet)
+
+mac1 <- subset(mac.subset.singlet, subset = nCount_RNA > 500 & percent_mito < 5)
+print_cell_count(mac1)
+```
+
+```{r Regress out mito, ribo and ENGS genes}
+# Identify mitochondrial genes
+mito_genes <- grep("^MT-", rownames(mac1), value = TRUE)
+
+# Identify ribosomal genes (RPS and RPL)
+ribo_genes <- grep("^RP[SL]", rownames(mac1), value = TRUE)
+
+# Identify ENSG genes to remove
+ensg_genes <- grep("^ENSG", rownames(mac1), value = TRUE)
+genes_to_remove <- ensg_genes
+mac1 <- subset(mac1, features = setdiff(rownames(mac1), genes_to_remove))
+
+# store mitochondrial percentage in object meta data
+mac1 <- PercentageFeatureSet(mac1, pattern = "^MT-", col.name = "percent.mt")
+mac1 <- PercentageFeatureSet(mac1, pattern = "^RP[SL]", col.name = "percent.rb")
+
+# run sctransform
+mac1 <- SCTransform(mac1,assay = 'RNA', vars.to.regress = c("percent.mt", "percent.rb", "HTO_classification"), verbose = TRUE)
+
+```
+
+```{r plot variable features}
+mac1 <- FindVariableFeatures(mac1, selection.method = "vst", nfeatures = 2000)
+mac1 <- RunPCA(mac1, features = VariableFeatures(object = mac1))
+
+# Examine and visualize PCA results a few different ways
+print(mac1[["pca"]], dims = 1:5, nfeatures = 5)
+
+```
+
+```{r UMAP visualization}
+# Check cluster identities of the first 5 cells
+head(Idents(mac1), 5)
+
+# Run UMAP on the dataset
+mac1 <- RunUMAP(mac1, dims = 1:10)
+
+# Adjust clustering resolution for finer or coarser granularity
+mac1 <- FindNeighbors(mac1, dims = 1:10)
+mac1 <- FindClusters(mac1, resolution = 0.2) 
+
+# Check the number of clusters
+table(Idents(mac1))
+
+donor_colors <- c(
+  "Patient-1a" = "#8FD8E0",  
+  "Patient-1b" = "#FF8C5A", 
+  "Patient-2a" = "#D9A9E2", 
+  "Patient-2b" = "#FF99AD", 
+  "Patient-3a" = "#4BAA71",
+  "Patient-3b" = "#F4C209"  
+)
+
+# Generate UMAP and tSNE plots
+umap_colors <- wes_palette("GrandBudapest1")
+DimPlot(mac1, reduction = "umap", cols = umap_colors, label = FALSE) +
+  ggtitle("UMAP of Cells")
+
+# UMAP colored by HTO classification
+DimPlot(mac1, reduction = "umap", group.by = "HTO_classification", label = FALSE, pt.size = 0.5, cols = donor_colors) +
+  ggtitle("UMAP Colored by HTO Classification")
+
+# Create a table of cell counts per cluster and HTO classification
+hto_cluster_table <- table(mac1$seurat_clusters, mac1$HTO_classification)
+
+# Convert to a data frame for ggplot2
+hto_cluster_df <- as.data.frame(hto_cluster_table)
+colnames(hto_cluster_df) <- c("Cluster", "HTO", "Cell_Count")
+
+# Stacked bar plot showing the HTO composition per cluster
+ggplot(hto_cluster_df, aes(x = Cluster, y = Cell_Count, fill = HTO)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "HTO Composition per Cluster",
+    y = "Number of Cells",
+    x = "Cluster"
+  ) +
+  scale_fill_manual(values = donor_colors) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Convert to wide format with clusters as rows and HTOs as columns
+hto_cluster_wide <- hto_cluster_df %>%
+  pivot_wider(names_from = HTO, values_from = Cell_Count, values_fill = 0) %>%
+  arrange(as.numeric(Cluster))
+
+# Print the reformatted table
+print(hto_cluster_wide)
+
+VlnPlot(
+  object = mac1, 
+  features = c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "log10GenesPerUMI"), 
+  ncol = 3, 
+  group.by = "seurat_clusters",  # Replace with the appropriate grouping column if needed
+  cols = umap_colors
+)
+
+phase_colors <- c(
+  "G1" = "#E69F00",   
+  "S" = "#56B4E9",    
+  "G2M" = "#009E73"    
+)
+DimPlot(mac1, reduction = "umap", group.by = "Phase", cols = phase_colors) +
+  ggtitle("UMAP Colored by Cell Cycle Phase")
+
+```
+
+```{r}
+# find markers for every cluster compared to all remaining cells, report only the positive values
+mac.markers <- FindAllMarkers(mac1, only.pos = TRUE, min.pct = 0.6)
+mac.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+
+#write.csv(mac.markers, "mac_markers_filtered_0.6.csv", row.names = FALSE)
+```
+```{r Heatmap of cluster based gene expression}
+# Find top markers
+seurat_object.markers <- FindAllMarkers(mac1, test.use = "wilcox",
+                                        only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.5)
+
+# Extract top 10 markers per cluster
+top10.sub <- seurat_object.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+
+# Ensure genes are present in the dataset
+valid_genes <- intersect(top10.sub$gene, rownames(mac1))
+
+# Calculate average expression
+seurat_object.avg <- AverageExpression(mac1, return.seurat = TRUE)
+
+# Generate heatmap
+heatmap <- DoHeatmap(seurat_object.avg,
+                     features = valid_genes,  # Use only available genes
+                     raster = FALSE,
+                     group.colors = NULL,
+                     draw.lines = FALSE) +
+  theme(text = element_text(size = 10),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14),
+        legend.key.size = unit(1.5, "cm")) +
+  scale_fill_gradientn(colors = colorRampPalette(c("#2C7BB6", "#FFFFBF", "#D7191C"))(256))
+
+# Print heatmap
+print(heatmap)
+```
+
+```{r Feature plots of UMAP}
+DefaultAssay(mac1) <- "SCT"
+FeaturePlot(mac1, features = c("STAT1", "HLA-DRA","CCL8", "TMSB10"), max.cutoff = 'q95', min.cutoff = 'q1')
+```
+
+```{r Dot plot of bulk M1 genes from figure 2}
+mac.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10
+
+# Define gene list from figrue 2
+bulk_genes <- c(
+  "ADAM19", "CCR7", "CCL5", "C1S", "CCL8", "MT1G", "MT2A", "MT1H", "ISG20", "IFITM1",
+  "MT1M", "CCL19", "ANKRD22", "SERPING1", "HAPLN3", "CALHM6", "FBLN1", "IFI27", "GBP1",
+  "IFIT3", "CXCL9", "CXCL11", "CXCL10", "OR2I1P", "ACOD1", "TNFAIP6", "IDO1",
+  "AC007991.4", "RSAD2", "GBP5", "GBP4", "F13A1", "CCL18", "CCL13", "DNASE1L3"
+)
+
+DotPlot(mac1, features = bulk_genes, group.by = "seurat_clusters") +
+  ggtitle("Gene DotPlot") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+```
+
+
+
+

@@ -1,0 +1,153 @@
+---
+title: "Label Transfer of MoMac Verse onto snRNAseq labels"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(ggplot2)
+#Download the RDS from DOI: 10.1016/j.immuni.2021.07.007, subset the RDS to macrophage only populations
+momac <- readRDS("/Users/f006frz/Dartmouth\ College\ Dropbox/Olivia\ Palmer/Goods\ Lab/Projects/COBRE_Macrophages/Experimental\ Data/mac_nucseq/nucseq/momac_downsample.RDS")
+#read in snRNA data
+snrna <- readRDS("snRNAseq.rds")
+
+```
+
+```{r}
+DimPlot(momac, group.by = "Clusters")
+```
+
+```{r}
+# ---------- settings ----------
+dims  <- 1:30
+nfeat <- 2500
+
+ensure_norm_vf <- function(obj, assay, nfeat = 3000) {
+  DefaultAssay(obj) <- assay
+
+  # ---- make counts sparse (Assay5 uses layers, not slots)
+  counts_mat <- GetAssayData(obj, assay = assay, layer = "counts")
+  if (!inherits(counts_mat, "dgCMatrix")) {
+    counts_mat <- as(counts_mat, "dgCMatrix")
+    obj <- SetAssayData(obj, assay = assay, layer = "counts", new.data = counts_mat)
+  }
+
+  # ---- normalize (writes to the default data layer)
+  obj <- NormalizeData(obj, assay = assay, verbose = FALSE)
+
+  # ---- variable features (no layer arg in v5 high-level API)
+  if (length(VariableFeatures(obj)) == 0) {
+    obj <- FindVariableFeatures(obj, assay = assay, nfeatures = nfeat, verbose = FALSE)
+  }
+
+  obj
+}
+
+pick_norm <- function(ref, query) {
+  if ("SCT" %in% Assays(ref) && "SCT" %in% Assays(query)) {
+    list(assay = "SCT", norm.method = "SCT")
+  } else {
+    list(assay = "RNA", norm.method = "LogNormalize")
+  }
+}
+nm <- pick_norm(momac, snrna)
+```
+
+```{r}
+momac <- ensure_norm_vf(momac, nm$assay, nfeat = 2000)
+snrna <- ensure_norm_vf(snrna, nm$assay, nfeat = 2000)
+
+DefaultAssay(momac) <- nm$assay
+DefaultAssay(snrna) <- nm$assay
+
+```
+
+```{r}
+# Scale + PCA on both
+momac <- ScaleData(momac, assay = nm$assay, verbose = FALSE)
+momac <- RunPCA(momac, assay = nm$assay, npcs = max(dims), verbose = FALSE)
+if (!"umap" %in% Reductions(momac)) {
+  momac <- RunUMAP(momac, assay = nm$assay, dims = dims, verbose = FALSE)
+}
+
+snrna <- ScaleData(snrna, assay = nm$assay, verbose = FALSE)
+snrna <- RunPCA(snrna, assay = nm$assay, npcs = max(dims), verbose = FALSE)
+```
+
+```{r}
+anchors_flip <- FindTransferAnchors(
+  reference = snrna, query = momac,
+  reference.assay = nm$assay, query.assay = nm$assay,
+  normalization.method = nm$norm.method,
+  reference.reduction = "pca", dims = 1:30
+)
+
+```
+
+```{r}
+ref_cols <- colnames(snrna[[]])
+refdata_list <- list()
+if ("seurat_clusters" %in% ref_cols) refdata_list$seurat_clusters <- "seurat_clusters"
+if ("orig.ident" %in% ref_cols)      refdata_list$orig_ident      <- "orig.ident"
+
+```
+
+```{r}
+snrna <- RunUMAP(
+  snrna, assay = nm$assay, dims = 1:30,
+  umap.method = "uwot",    # default in Seurat ≥5
+  metric = "cosine",       # default for uwot in Seurat ≥5
+  return.model = TRUE,    
+  verbose = FALSE
+)
+
+momac_on_snrna <- MapQuery(
+  anchorset = anchors_flip, query = momac, reference = snrna,
+  refdata = if (length(refdata_list)) refdata_list else NULL,
+  reference.reduction = "pca", reduction.model = "umap"
+)
+```
+
+```{r}
+# Make identities snRNA clusters and cluster
+Idents(snrna) <- "seurat_clusters"
+cl_lvls <- levels(snrna)
+
+# Build a NAMED palette for those levels
+pal_sn <- setNames(wes_palette("GrandBudapest1", n = length(cl_lvls), type = "discrete"),
+                   cl_lvls)
+
+DimPlot(momac_on_snrna, group.by = "predicted.seurat_clusters", raster = FALSE, cols = pal_sn) 
+#DimPlot(momac_on_snrna, group.by = "Tissue", raster = TRUE) 
+```
+
+```{r stacked bar plot by tissue}
+score_col <- "predicted.seurat_clusters.score"
+if (score_col %in% colnames(momac_on_snrna[[]])) {
+  VlnPlot(momac_on_snrna, features = score_col, pt.size = 0, raster = FALSE) +
+    ggtitle("Prediction confidence (MoMac mapped onto snRNA)")
+  momac_on_snrna$pred_filtered <- ifelse(
+    momac_on_snrna[[score_col]] < 0.3, "Unassigned",
+    momac_on_snrna$predicted.seurat_clusters
+  )
+}
+
+meta_flip <- momac_on_snrna[[]]
+meta_flip$Tissue <- factor(meta_flip$Tissue)
+
+df_counts_flip_tissue <- meta_flip %>%
+  filter(!is.na(.data[[lab]]), !is.na(Tissue)) %>%
+  filter(.data[[lab]] != "Unassigned") %>%   # threshold  0.3
+  count(.data[[lab]], Tissue, name = "n") %>%
+  mutate(
+    Tissue = fct_drop(Tissue),
+    !!lab := fct_reorder(.data[[lab]], n, .fun = sum, .desc = TRUE)
+  )
+
+ggplot(df_counts_flip_tissue, aes(x = .data[[lab]], y = n, fill = Tissue)) +
+  geom_col() +
+  labs(x = "snRNA cluster (transferred to MoMac)", y = "Number of MoMac cells",
+       fill = "Tissue", title = "MoMac mapped onto snRNA UMAP: counts by cluster and Tissue") +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
