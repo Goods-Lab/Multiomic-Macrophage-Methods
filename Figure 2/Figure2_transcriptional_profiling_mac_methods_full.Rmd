@@ -1,0 +1,174 @@
+---
+title: "Transcriptional profiling of bulk RNA from cultured macrophages"
+output: html_notebook
+---
+
+
+```{r set up}
+library("DESeq2")
+library(ggplot2)
+library(sva)
+library(pheatmap)
+library(tidyverse)
+library(cowplot)
+```
+
+```{r load the data}
+counts <- read.csv("~Figure2_transcriptional_profiling/methods_counts.csv")
+metadata <- read.csv("~Figure2_transcriptional_profiling/methods_meta.csv")
+
+counts <- counts[!duplicated(counts$gene_name), ]
+
+metadata_mod <- metadata[-1]
+row.names(metadata_mod) <- metadata$sample_ID
+#metadata_mod
+
+counts_mod <- counts[-1]
+row.names(counts_mod) <- counts$gene_name
+#counts_mod
+```
+
+```{r count matrix input}
+# Count matrix input
+cts <- as.matrix(apply(counts_mod, c(1,2), round))
+coldata <- metadata_mod[,c("Sex","Stimuli", "Cell", "Donor", "Combined")]
+
+coldata$Sex <- factor(coldata$Sex)
+coldata$Stimuli <- factor(coldata$Stimuli)
+coldata$Cell <- factor(coldata$Cell)
+coldata$Donor <- factor(coldata$Donor)
+coldata$Combined <- factor(coldata$Combined)
+
+```
+
+```{r make dds object}
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ Cell)
+dds <- DESeq(dds)
+res <- results(dds)
+
+saveRDS(dds, file = "mac_methods_stimuli_DESeq2.rds")
+```
+
+```{r Data transformation}
+# Data transformation and visualization
+rld <- rlog(dds, blind=FALSE)
+ntd <- normTransform(dds)
+#head(assay(rld), 3)
+```
+
+```{r Principal component plot of the experimentl samples}
+plotPCA(rld, intgroup=c("Stimuli"))
+
+Data <- plotPCA(rld, intgroup=c("Sex"), returnData=TRUE)
+percentVar <- round(100 * attr(Data, "percentVar"))
+p1 <- ggplot(Data, aes(PC1, PC2, color=Sex)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+
+Data2 <- plotPCA(rld, intgroup=c("Stimuli", "Sex"), returnData=TRUE)
+percentVar <- round(100 * attr(Data, "percentVar"))
+p2 <- ggplot(Data2, aes(PC1, PC2, color=Stimuli, shape=Sex)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+
+```
+
+
+```{r}
+# Ensure 'Sex' is a factor with the correct order
+Data2$Sex <- factor(Data2$Sex, levels = c("Male", "Female"))
+
+Data2 <- plotPCA(rld, intgroup=c("Stimuli", "Sex"), returnData=TRUE)
+percentVar <- round(100 * attr(Data, "percentVar"))
+p4 <- ggplot(Data2, aes(PC1, PC2, color=Stimuli, shape=Sex)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() +
+  theme_bw()  # Removes the gray background
+  scale_shape_manual(values = c("Female" = 17, "Male" = 16))
+
+p4 <- p4 + theme(aspect.ratio = 1)
+#ggsave("methods_PCA_plot.pdf", p4, width=4, height=4, dpi=300) 
+p4
+```
+
+```{r}
+# Select the top 30 most variable genes
+df <- as.data.frame(colData(dds)[,c("Cell","Stimuli","Sex")])
+
+#Define annotation colors
+ann_colors <- list(
+  Sex = c(Female = "pink2", Male = "mediumseagreen"), 
+  Stimuli = c(MCSF_50 = "grey24", MCSF_25 = "grey", IL4 = "#2F6776",
+              LPS_10 = "darkred", LPS_100 = "#BF6281"),
+  Cell = c(M0 = "grey", M1 = "darkred", M2 = "#2F6776"))
+
+#pdf("rld_variable_heatmap_output.pdf", width=10, height=8)  # Set PDF file name & dimensions
+rld_heat <- pheatmap(assay(rld)[order(rowVars(assay(rld)), decreasing=TRUE)[1:30],], 
+         cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=TRUE, annotation_col=df,
+         annotation_colors=ann_colors,
+         color=colorRampPalette(c("navyblue", "white", "firebrick3"))(25),
+         scale="row",
+         clustering_distance_cols="euclidean",  # Cluster based on correlation
+         clustering_method="complete",
+         fontsize_row=8, fontsize_col=8)
+#dev.off()  # **Closes PDF output**
+rld_heat
+```
+
+```{r DESeq2 Differential Gene Expression}
+M1_res <- results(dds, name="Cell_M1_vs_M0") 
+M2_res <- results(dds, name="Cell_M2_vs_M0") 
+write.csv(M1_res, file="DESeq2_Cell_M1_vs_M0.csv")
+write.csv(M2_res, file="DESeq2_Cell_M2_vs_M0.csv")
+```
+
+```{r}
+dds2 <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ Stimuli)
+dds2 <- DESeq(dds2)
+dds2$Stimuli <- relevel(dds2$Stimuli, ref = "LPS_10")
+
+# Extract results for a specific contrast
+res2 <- results(dds2)
+
+# Convert to data frame and clean
+res_df <- as.data.frame(res2) %>%
+  rownames_to_column(var = "gene") %>%
+  filter(!is.na(padj))  # Remove NA p-values
+
+# Add significance labels
+res_df <- res_df %>%
+  mutate(significance = case_when(
+    padj < 0.05 & log2FoldChange > 1 ~ "Upregulated",
+    padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+    TRUE ~ "Not Significant"
+  ))
+
+# Volcano plot using ggplot2
+volcano_plot <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "gray")) +
+  theme_minimal() +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(
+    title = "Volcano Plot",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value"
+  ) +
+  theme(legend.position = "top")
+
+# Display the plot
+print(volcano_plot)
+
+```
